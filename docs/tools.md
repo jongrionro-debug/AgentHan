@@ -1,7 +1,8 @@
 # 도구 스펙 (2026-11-12 확정)
 
-기능 하나에 도구 하나다. 도구 이름은 그대로 두고, 한 도구 안의 여러 작업은 `action` 같은 선택 인자로 나눈다.
+기존 기능 도구는 기능당 하나이며, 한 도구 안의 여러 작업은 `action` 같은 선택 인자로 나눈다.
 정본은 `src/agenthan/tools/feature_tools.py`의 `_TOOL_LIST`이고, 이 문서는 그 요약이다.
+planner 모드는 `agent/planner_loop.py`에서 쓰기 기능별 `read_<feature>` 조회 도구를 추가한다(B6).
 쓰기 도구는 미리보기 → 사장님 "네" 뒤에만 저장된다. 모든 값은 사장님이 이 대화에서 말한 값만 쓴다
 (`agent/value_source.py`가 확인).
 
@@ -9,7 +10,7 @@
 
 | | 결정 |
 |---|---|
-| A | 기능당 도구 하나 유지. 쓰기 작업 종류는 선택 인자(`action` 등)로 나눈다 |
+| A | 기존 기능 도구와 planner 조회 도구를 분리. 쓰기 작업 종류는 선택 인자(`action` 등)로 나눈다 |
 | B | 기간은 한 가지 표현: `today, yesterday, this_week, last_week, this_month, last_month` |
 | C | 사진은 도구 인자로 받지 않는다(메뉴 사진은 `/photo` 흐름). 예약 받을 시간·인원 설정은 범위 밖 |
 | D | 대표키워드는 `add`/`remove`로 고친다. 전부 바꾸라고 할 때만 `keywords`(전체 목록) |
@@ -30,9 +31,15 @@
 | 매장결제 | `set_onsite_payment` | **enabled** | 켜기·끄기 |
 
 주문·예약·톡톡은 코드가 사장님 말로 대상 후보를 좁혀 id 인자를 그 후보 enum으로 연다. 목록을 묻는
-질문은 도구 없이 후보로 답한다.
+질문은 planner의 `read_order`·`read_reservation`·`read_talktalk`으로 후보를 읽고, legacy는 도구 없이 후보로 답한다.
 
 ## 조회 도구
+
+planner의 `operation=read` 단계는 조회 도구와 `ask_owner`만 사용한다. 쓰기 기능에는
+`read_menu`, `read_business_info`, `read_business_hours`, `read_talktalk`, `read_order`,
+`read_reservation`, `read_search_keywords`, `read_coupon`, `read_new_opening`,
+`read_onsite_payment`를 제공한다(인자 없음). `store_slice` 또는 현재 발화로 좁힌 대상 후보만
+읽으며 작업 생성·재개·미리보기 변경·저장은 하지 않는다. 아래 기존 조회 도구도 그대로 쓴다.
 
 | 기능 | 도구 | 인자 | 비고 |
 |---|---|---|---|
@@ -49,4 +56,4 @@
 - 통계 `get_statistics`의 기간(7d·30d)은 공통 기간으로 바꾸지 않았다. 통계 질문은 `report_explainer`가 처리한다.
 - 리뷰 서브에이전트 도구(`analyze_reviews` 등)의 기간(1d·7d·30d·90d·all)은 그대로다. 근형님과 맞출 때 같이 바꾼다.
 - 쿠폰 최소 주문 금액·대상 메뉴는 넣었다가 뺐다. 선택 입력으로 열어 두면 HCX-005가 프롬프트·재요청에도 매번 그 값을 되물어 쿠폰 만들기가 끝나지 않았다(S1 `missing-coupon`).
-- 전화 기록 기간 필터, 쿠폰 목록·중지, 새 오픈 신청 조건 검사는 없다.
+- 전화 기록 기간 필터, 쿠폰 중지, 새 오픈 신청 조건 검사는 없다. 쿠폰 목록은 planner의 `read_coupon`으로 읽는다.

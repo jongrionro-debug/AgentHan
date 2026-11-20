@@ -22,7 +22,7 @@ from agenthan.core.embedding import ClovaEmbeddingError
 from agenthan.eval.cases import Case, Turn
 from agenthan.eval.metrics import UNSAFE_KINDS, summarize
 from agenthan.eval.replay import canonical
-from agenthan.tools.feature_tools import TOOL_FEATURES, needs_approval
+from agenthan.tools.feature_tools import STORE_READ_TOOLS, TOOL_FEATURES, needs_approval
 
 ROUTE_ONLY = frozenset({"statistics", *REVIEW_FEATURES})
 UNSCORED = object()
@@ -99,7 +99,7 @@ def expected_feature(case: Case, index: int, turn: Turn):
         return UNSCORED
     tool = turn.expect.tool or case.near_tool
     if tool:
-        return TOOL_FEATURES.get(tool, tool)
+        return TOOL_FEATURES.get(tool, STORE_READ_TOOLS.get(tool, tool))
     return case.expected_feature
 
 

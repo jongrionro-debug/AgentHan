@@ -72,6 +72,7 @@ class Step:
     target_metric: str | None = None
     target_order: str = "max"
     owner_values: tuple[tuple[str, str, str], ...] = ()  # 필드·추출 값·사장님 원문 근거
+    operation: str = "write"  # read는 원장·미리보기를 건드리지 않는 조회 단계
 
     @property
     def identity(self):
@@ -87,6 +88,7 @@ class Step:
             self.target_metric,
             self.target_order,
             self.owner_values,
+            self.operation,
         )
 
     def as_trace(self) -> dict:
@@ -107,6 +109,8 @@ class Step:
             out["owner_values"] = [
                 {"field": k, "value": v, "evidence": q} for k, v, q in self.owner_values
             ]
+        if self.operation == "read":
+            out["operation"] = "read"
         return out
 
 
@@ -313,6 +317,7 @@ def ledger_schema(
         "kind": {"type": "string", "enum": list(KINDS) if task_ids else ["new"]},
         "feature": {"type": "string", "enum": feature_ids()},
         "goal": {"type": "string"},
+        "operation": {"type": "string", "enum": ["read", "write"]},
         "review_action": {"type": "string", "enum": ["none", "read", "draft", "settings"]},
         "basis": {"type": "string", "enum": ["requested", "supporting"]},
         "needs": {"type": "array", "items": {"type": "string", "enum": feature_ids()}},
@@ -349,6 +354,7 @@ def ledger_schema(
                         "kind",
                         "feature",
                         "goal",
+                        "operation",
                         "basis",
                         "review_action",
                         "ref_basis",
@@ -388,6 +394,11 @@ LEDGER_SYSTEM = (
     '저장해"). 값을 바꾸는 말이 섞이면 approve가 아니라 revise다.\n'
     '- cancel: 열린 작업을 그만두라는 말("취소", "그건 안 할게요").\n'
     "- new: 열린 작업과 다른 새 요청. 열린 작업은 보류된 채 남는다.\n"
+    "모든 단계에 operation=read(보기) 또는 write(바꾸기)를 고른다. "
+    "현재 값·내역을 묻는 질문은 같은 기능의 열린 작업이 있어도 new/read이며 그 작업을 "
+    "이어 하거나 수정하지 않는다. read에는 조회 도구만 제공된다. "
+    "리뷰 read는 operation=read, draft·settings는 write다. "
+    "승인·취소와 값을 채우는 continue·revise는 write다.\n"
     "continue·revise·approve·cancel은 task_id에 열린 작업 id를 쓰고 feature는 그 작업의 기능이다. "
     '"네", "그걸로", "취소" 같은 짧은 말은 열린 작업이 하나면 그 작업에 대한 말이다. '
     "여럿이면 미리보기가 있는 작업, 그다음 맨 위(첫 번째) 작업 순으로 본다.\n"
@@ -580,10 +591,15 @@ def parse_ledger_plan(
                 raise PlanError("task outside the ledger")
             feature = tasks[task_id]
         review_action = raw.get("review_action")
+        operation = raw.get("operation", "write")
+        if operation not in ("read", "write"):
+            drop(index, "operation")
+            operation = "write"
         review_action = None if review_action == "none" else review_action
         if kind in ("approve", "cancel"):
             # 승인·취소는 원장 미리보기 하나에 대한 결정이다. 리뷰 행동은 원장이 정한다.
             review_action = None
+            operation = "write"
         elif review_action is not None and (
             feature != "review" or review_action not in ("read", "draft", "settings")
         ):
@@ -591,6 +607,10 @@ def parse_ledger_plan(
             review_action = None
         if kind == "new" and feature == "review" and review_action is None:
             raise PlanError("review action required")
+        if feature == "review":
+            operation = "read" if review_action == "read" else "write"
+        if operation == "read" and kind in ("continue", "revise"):
+            kind, task_id = "new", None
         basis = raw.get("basis", "requested")
         if basis not in ("requested", "supporting"):
             drop(index, "basis")
@@ -660,6 +680,7 @@ def parse_ledger_plan(
             metric,
             order,
             tuple(extracted),
+            operation,
         )
         if not any(s.identity == step.identity for s in steps):
             steps.append(step)
@@ -691,6 +712,7 @@ def parse_ledger_plan(
             and step.target_metric == merged[-1].target_metric
             and step.target_order == merged[-1].target_order
             and step.owner_values == merged[-1].owner_values
+            and step.operation == merged[-1].operation
         ):
             merged[-1] = replace(merged[-1], goal=merged[-1].goal + " / " + step.goal)
         else:

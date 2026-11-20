@@ -91,8 +91,9 @@ class HCX:
         return response
 
 
-def new(feature, ref=None, scope="store", review_action=None):
+def new(feature, ref=None, scope="store", review_action=None, operation="write"):
     step = {"kind": "new", "feature": feature, "goal": feature}
+    step["operation"] = operation
     if ref:
         step["ref"] = ref
         step["ref_basis"] = "direct"
@@ -158,6 +159,206 @@ def settings_plan(text, **values):
         for k, v in values.items()
     ]
     return planned
+
+
+@pytest.mark.parametrize(
+    ("feature", "question"),
+    [
+        ("menu", "블린 지금 얼마인가요?"),
+        ("menu", "블린의 등록된 가격을 보여 주세요"),
+        ("order", "오늘 접수된 주문이 있어요?"),
+        ("order", "주문 내역 좀 확인해 주세요"),
+    ],
+)
+def test_b6_read_preserves_original_preview_and_next_approval(tmp_path, feature, question):
+    from agenthan.tools.feature_tools import needs_approval
+
+    hcx = HCX(
+        [],
+        call("upsert_menu", name="블린", price=9500),
+        call(f"read_{feature}"),
+        {"role": "assistant", "content": "조회"},
+        plans=[new("menu"), new(feature, operation="read")],
+    )
+    app = assistant(tmp_path, hcx)
+    before = app.store.read()
+    app.ask("블린 가격을 9500원으로 바꿔 주세요")
+    task = app.ledger.active()
+    snapshot = copy.deepcopy(task)
+    stack = list(app.ledger.stack)
+    reply = app.ask(question)
+    assert app.store.read() == before and [t.id for t in app.ledger.tasks] == [snapshot.id]
+    assert app.ledger.stack == stack and app.ledger.active() is task
+    assert task.preview == snapshot.preview and task.version == snapshot.version
+    assert (task.status, task.said, task.slots, task.touched) == (
+        snapshot.status,
+        snapshot.said,
+        snapshot.slots,
+        snapshot.touched,
+    )
+    assert {t["function"]["name"] for t in hcx.requests[1][1]} == {f"read_{feature}", "ask_owner"}
+    assert "조회" in reply and "필요한 값" not in reply
+    if feature == "menu":
+        original = next(m for m in before["menus"] if m["name"] == "블린")
+        assert "블린" in reply and str(original["price"]) in reply
+    assert app.trace["legacy_model_calls"] == 0
+    assert not needs_approval(f"read_{feature}") and needs_approval("read_unknown")
+    assert normalize_trace(app.trace)["calls"] == [
+        {"tool": f"read_{feature}", "feature": feature, "action": "ok"}
+    ]
+    app.ask("네")
+    assert next(m for m in app.store.read()["menus"] if m["name"] == "블린")["price"] == 9500
+    assert task.status == "done" and not app.ledger.open_tasks()
+
+
+@pytest.mark.parametrize(
+    "utterances",
+    [
+        ("1500원 할인 쿠폰을 만들어 줘", "이름은 이웃 감사", "2026-12-01부터 2026-12-07까지"),
+        (
+            "쿠폰으로 1500원 깎아 주세요",
+            "쿠폰 이름을 이웃 감사로 해요",
+            "쿠폰 사용 기간은 2026-12-01에서 2026-12-07까지예요",
+        ),
+    ],
+)
+def test_b6_three_turn_values_reach_act_and_value_source(tmp_path, utterances):
+    hcx = HCX(
+        [],
+        call("create_coupon", discount_type="amount", discount_value=1500),
+        call("create_coupon", title="이웃 감사"),
+        call("create_coupon", start_date="2026-12-01", end_date="2026-12-07"),
+        plans=[new("coupon"), on("continue", "t1", "coupon"), on("continue", "t1", "coupon")],
+    )
+    app = assistant(tmp_path, hcx)
+    select_routes(
+        app, {"feature_id": "coupon", "act": "answer"}, {"feature_id": "coupon", "act": "answer"}
+    )
+    before = app.store.read()
+    for text in utterances:
+        reply = app.ask(text)
+    task = app.ledger.active()
+    prompt = hcx.requests[-1][0][1]["content"]
+    assert all(text in prompt for text in utterances)
+    memory = prompt.split("이 작업에서 사장님이 한 말: ")[1].split("\n이미 확인된 값:")[0]
+    assert json.loads(memory) == list(utterances)
+    assert '"discount_value": 1500' in prompt and '"title": "이웃 감사"' in prompt
+    assert task.said == list(utterances)
+    assert "바꿀까요" in reply and task.preview and app.store.read() == before
+    assert all(
+        task.slots[k].source == "owner"
+        for k in ("title", "discount_value", "start_date", "end_date")
+    )
+    assert app.trace["legacy_model_calls"] == 0
+    app.ask("네")
+    coupon = app.store.read()["coupons"][0]
+    assert {
+        k: coupon[k] for k in ("title", "discount_type", "discount_value", "start_date", "end_date")
+    } == {
+        "title": "이웃 감사",
+        "discount_type": "amount",
+        "discount_value": 1500,
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-07",
+    }
+
+
+@pytest.mark.parametrize("question", ["쿠폰을 하나 만들고 싶어요", "새 할인 쿠폰 등록을 도와줘"])
+@pytest.mark.parametrize("response", [call("ask_owner", fields=[]), call("create_coupon")])
+def test_b6_empty_ask_and_missing_fields_use_required_labels(tmp_path, question, response):
+    from agenthan.tools.feature_tools import TOOLS
+
+    hcx = HCX([], response, plans=[new("coupon")])
+    app = assistant(tmp_path, hcx)
+    before = app.store.read()
+    reply = app.ask(question)
+    required = [p.label for p in TOOLS["coupon"].params if p.required]
+    assert all(label in reply for label in required)
+    assert app.trace["missing"] == required
+    assert "필요한 값이나 대상" not in reply and "알려 주세요" in reply
+    assert app.store.read() == before and app.ledger.active().preview is None
+
+
+@pytest.mark.parametrize("question", ["메뉴 가격을 확인해 줘", "지금 메뉴판을 읽어 주세요"])
+def test_b6_read_step_rejects_write_tool_even_for_same_feature(tmp_path, question):
+    hcx = HCX(
+        [],
+        call("upsert_menu", name="블린", price=9000),
+        call("read_menu"),
+        {"role": "assistant", "content": "조회"},
+        plans=[new("menu", operation="read"), new("menu", operation="read")],
+    )
+    app = assistant(tmp_path, hcx)
+    before = app.store.read()
+    reply = app.ask(question)
+    assert app.store.read() == before and not app.ledger.tasks
+    assert all(c["name"] == "read_menu" for c in app.trace["calls"])
+    assert "블린" in reply and app.trace["loop_budget"]["replans"] == 1
+
+
+@pytest.mark.parametrize("kind", ["continue", "revise"])
+def test_b6_read_of_a_held_task_does_not_resume_it(tmp_path, kind):
+    planned = on(kind, "t1", "menu", "등록된 메뉴를 조회")
+    planned["steps"][0]["operation"] = "read"
+    hcx = HCX([], call("read_menu"), {"role": "assistant", "content": "조회"}, plans=[planned])
+    app = assistant(tmp_path, hcx)
+    held = app.ledger.start("menu")
+    held.said.append("메뉴 등록할게요")
+    current = app.ledger.start("coupon")
+    before = copy.deepcopy(held)
+    app.ask("메뉴의 현재 가격을 볼게요")
+    assert app.ledger.stack == [held.id, current.id] and app.ledger.active() is current
+    assert held == before and len(app.ledger.tasks) == 2
+    assert app.trace["planner"]["steps"][0]["operation"] == "read"
+    assert not app.trace.get("ledger_steps")
+
+
+@pytest.mark.parametrize("edit", ["아 잠깐 10000원으로 바꿔 줘", "금액은 10000원이 맞아요"])
+def test_b6_old_task_words_cannot_replace_a_later_confirmed_value(tmp_path, edit):
+    hcx = HCX(
+        [],
+        call("upsert_menu", name="블린", price=9500),
+        call("upsert_menu", name="블린", price=10000),
+        call("upsert_menu", name="블린", price=9500),
+        plans=[new("menu"), on("revise", "t1", "menu"), on("continue", "t1", "menu")],
+    )
+    app = assistant(tmp_path, hcx)
+    select_routes(app, {"feature_id": "menu", "act": "resume"})
+    initial, resume = "블린 가격은 9500원으로 해 줘", "아까 메뉴 작업을 이어갈게요"
+    app.ask(initial)
+    app.ask(edit)
+    app.ask(resume)
+    task = app.ledger.active()
+    assert task.said == [initial, edit, resume]
+    assert task.slots["price"].value == 10000 and task.preview
+    assert app.trace["kept_slots"] == ["price"]
+    app.ask("네")
+    assert next(m for m in app.store.read()["menus"] if m["name"] == "블린")["price"] == 10000
+
+
+@pytest.mark.parametrize("edit", ["블린 가격은 10000원으로 고쳐 줘", "아니 블린을 10000원으로"])
+def test_b6_revision_keeps_the_read_waiting_for_approval(tmp_path, edit):
+    hcx = HCX(
+        [],
+        call("upsert_menu", name="블린", price=9500),
+        call("upsert_menu", name="블린", price=10000),
+        call("list_call_history", missed_only=True),
+        {"role": "assistant", "content": "조회"},
+        plans=[
+            chain_plan(new("menu")["steps"][0], new("smartcall")["steps"][0]),
+            on("revise", "t1", "menu"),
+        ],
+    )
+    app = assistant(tmp_path, hcx)
+    before = app.store.read()
+    app.ask("블린을 9500원으로 바꾸고 저장 뒤에 부재중 전화를 알려 주세요")
+    app.ask(edit)
+    assert [s.feature for s in app.planner_loop.batch.remaining] == ["smartcall"]
+    assert app.store.read() == before and len(hcx.requests) == 2
+    reply = app.ask("네")
+    assert "전화 기록" in reply and "저장" in reply
+    assert next(m for m in app.store.read()["menus"] if m["name"] == "블린")["price"] == 10000
+    assert app.trace["calls"][-1]["name"] == "list_call_history"
 
 
 @pytest.mark.parametrize(
@@ -247,7 +448,11 @@ def test_b5g_settings_semantics_come_from_extracted_owner_evidence(tmp_path, own
         {"field": "focus", "value": "complaint", "evidence": owner_text},
         {"field": "alert", "value": "negative", "evidence": owner_text},
     ]
-    hcx = HCX([], plans=[chain_plan(step, writes=("review",))])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        plans=[chain_plan(step, writes=("review",))],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     reply = app.ask(owner_text)
@@ -275,7 +480,12 @@ def test_b5g_yes_after_review_candidate_question_uses_recorded_proposals(
         return {"text": "어느 리뷰에 답글을 쓸까요?", "blocks": "\n".join(r["text"] for r in rows)}
 
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", delegate)
-    hcx = HCX([], plans=[new("review")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[new("review")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     app.ask("아직 회신하지 않은 손님 글을 보여 주세요")
@@ -354,7 +564,7 @@ def test_b5g_one_review_and_alias_are_enough_for_a_chain(
 )
 def test_b5g_settings_without_real_owner_evidence_ask_and_never_save(tmp_path, owner_text):
     planned = settings_plan("사장님이 말하지 않은 문장", focus="complaint")
-    hcx = HCX([], plans=[planned])
+    hcx = HCX([], call("ask_review_agent", request="계획 실행"), plans=[planned])
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     reply = app.ask(owner_text)
@@ -434,7 +644,11 @@ def test_b5g_advice_proposal_does_not_approve_an_unrelated_preview(tmp_path, mon
 @pytest.mark.parametrize("yes", ["네", "좋아요"])
 def test_b5g_extracted_settings_are_rechecked_at_approval(tmp_path, yes):
     owner_text = "실망스러웠다는 손님 글만 알림 받고 싶어요"
-    hcx = HCX([], plans=[settings_plan(owner_text, focus="complaint")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        plans=[settings_plan(owner_text, focus="complaint")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     app.ask(owner_text)
@@ -487,7 +701,12 @@ def test_b5g_settings_reverted_to_original_value_also_update_history(tmp_path, o
     first = "실망스러운 글만 보고 싶어요"
     revision = settings_plan(owner_text, focus="all")
     revision["steps"][0].update(kind="revise", task_id="t1")
-    hcx = HCX([], plans=[settings_plan(first, focus="complaint"), revision])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        call("ask_review_agent", request="계획 실행"),
+        plans=[settings_plan(first, focus="complaint"), revision],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     app.ask(first)
@@ -632,7 +851,12 @@ def test_b5e_criteria_ref_is_delegated_and_cannot_override_the_review_agent(tmp_
         return {"text": "초안", "blocks": ""}
 
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", delegate)
-    hcx = HCX([], plans=[planned])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[planned],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     before = app.store.read()
@@ -693,7 +917,12 @@ def test_b5e_review_labels_keep_the_delegate_sentiment(tmp_path, monkeypatch):
         return {"text": "리뷰 목록", "blocks": "원문"}
 
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", delegate)
-    hcx = HCX([], plans=[new("review")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[new("review")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     app.ask("리뷰를 보여 주세요")
@@ -854,7 +1083,7 @@ def test_small_talk_reuses_the_legacy_help_without_rejection(tmp_path):
     assert app.trace["scope_check"] == "none"
 
 
-def test_hybrid_single_read_uses_legacy_sentence(tmp_path):
+def test_single_read_uses_loop_sentence(tmp_path):
     text = "이번 주 정산 예정액은 116,400원이고 입금 예정일은 2026-11-13이에요."
     hcx = HCX(
         ["settlement"],
@@ -865,7 +1094,10 @@ def test_hybrid_single_read_uses_legacy_sentence(tmp_path):
     reply = app.ask("이번 주 정산 얼마예요?")
     assert text in reply and "=" not in reply
     assert len(hcx.requests) == 2
-    assert {t["function"]["name"] for t in hcx.requests[0][1]} == {"get_settlement_summary"}
+    assert {t["function"]["name"] for t in hcx.requests[0][1]} == {
+        "get_settlement_summary",
+        "ask_owner",
+    }
 
 
 def test_two_features_preview_then_one_approval_saves_both(tmp_path):
@@ -1140,6 +1372,7 @@ def test_review_report_settings_wait_for_preview_approval(tmp_path):
     request = "리뷰 보고를 매주 월요일 오전 9시에 보내줘"
     hcx = HCX(
         [],
+        call("ask_review_agent", request="계획 실행"),
         plans=[
             settings_plan(request, enabled=True, frequency="weekly", weekday="mon", time="09:00")
         ],
@@ -1439,6 +1672,8 @@ def test_review_report_revision_reuses_the_original_task(tmp_path, edit, weekday
     first = "리뷰 보고를 매주 월요일 오전 9시에 보내줘"
     hcx = HCX(
         [],
+        call("ask_review_agent", request="계획 실행"),
+        call("ask_review_agent", request="계획 실행"),
         plans=[
             settings_plan(first, enabled=True, frequency="weekly", weekday="mon", time="09:00"),
             settings_plan(edit, weekday=weekday, time="10:00")
@@ -1490,6 +1725,7 @@ def test_message_api_exposes_planner_actions_and_a_safe_settings_preview(tmp_pat
     request = "리뷰 보고를 매주 월요일 오전 9시에 보내줘"
     hcx = HCX(
         [],
+        call("ask_review_agent", request="계획 실행"),
         plans=[
             settings_plan(request, enabled=True, frequency="weekly", weekday="mon", time="09:00")
         ],
@@ -1546,6 +1782,8 @@ def test_hybrid_planner_failure_falls_back_to_the_legacy_route(tmp_path):
     assert len(hcx.plans) == 2  # 계획 1회 + 재계획 1회
     assert "116,400" in reply and "=" not in reply and "어떤 일을" not in reply
     assert app.trace["loop_budget"]["replans"] == 1
+    assert app.trace["fallback"] is True and normalize_trace(app.trace)["fallback"] is True
+    assert app.trace["legacy_model_calls"] == 2
 
 
 def test_advice_scope_preserves_a_read_without_adding_unplanned_statistics(tmp_path):
@@ -1558,7 +1796,10 @@ def test_advice_scope_preserves_a_read_without_adding_unplanned_statistics(tmp_p
     app = assistant(tmp_path, hcx)
     before = app.store.read()
     reply = app.ask("네이버페이 가입하려면 개인사업자는 서류 뭐 필요해요?")
-    assert {t["function"]["name"] for t in hcx.requests[0][1]} == {"get_naverpay_signup_guide"}
+    assert {t["function"]["name"] for t in hcx.requests[0][1]} == {
+        "get_naverpay_signup_guide",
+        "ask_owner",
+    }
     assert "서류" in reply and "통계 신호" not in reply
     assert app.store.read() == before and app.pending_action is None
     assert all(a["action_id"] != "task.approve" for a in app.next_actions)
@@ -1701,7 +1942,7 @@ def test_ledger_approve_without_approval_words_only_continues(tmp_path):
 def test_ledger_resumes_a_held_task_and_keeps_the_other_preview(tmp_path):
     hcx = HCX(
         [],
-        {"role": "assistant", "content": "어떤 메뉴를 얼마에 등록할까요?"},
+        call("ask_owner", fields=["메뉴 이름", "가격 (원)"]),
         call("update_business_hours", days=["mon"], closed=True),
         call("upsert_menu", name="연습 차", price=5000),
         plans=[
@@ -1767,7 +2008,12 @@ def test_ref_picks_a_directly_named_shown_review_and_records_a_lookup_source(tmp
             ),
         },
     )
-    hcx = HCX([], plans=[new("review"), new("review", ref="r02")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[new("review"), new("review", ref="r02")],
+    )
     app = assistant(tmp_path, hcx)
     app.ask("요즘 리뷰 보여 줘")
     before = app.store.read()
@@ -1888,7 +2134,7 @@ def test_b5c_duplicate_steps_do_not_reexecute_or_report_exhaustion(tmp_path):
     assert app.pending_action
 
 
-def test_b5c_empty_legacy_continuation_asks_for_missing_values(tmp_path):
+def test_empty_loop_continuation_asks_for_missing_values(tmp_path):
     hcx = HCX(
         [],
         {"role": "assistant", "content": ""},
@@ -1902,7 +2148,7 @@ def test_b5c_empty_legacy_continuation_asks_for_missing_values(tmp_path):
     assert app.history[-1]["content"] == reply and task.prompt == reply
 
 
-def test_b5c_single_feature_legacy_execution_is_outside_loop_deadline(tmp_path, monkeypatch):
+def test_single_feature_loop_execution_obeys_deadline(tmp_path, monkeypatch):
     clock = [0.0]
     monkeypatch.setattr("agenthan.agent.loop_budget.time.monotonic", lambda: clock[0])
     hcx = HCX(["menu"], call("upsert_menu", name="연습 차", price=5000))
@@ -1912,14 +2158,15 @@ def test_b5c_single_feature_legacy_execution_is_outside_loop_deadline(tmp_path, 
     def late(*args, **kwargs):
         from agenthan.core.llm import call_deadline
 
-        assert call_deadline.get() is None
+        assert call_deadline.get() == 20.0
         clock[0] = 25.0
         return send(*args, **kwargs)
 
     app.chat = late
     reply = app.ask("연습 차 5000원 등록해 줘")
-    assert "바꿀까요" in reply and app.pending_action
-    assert not app.trace["budget_exhausted"]
+    assert "처리 한도" in reply and app.pending_action is None
+    assert app.trace["budget_exhausted"] and app.trace["loop_budget"]["reason"] == "wall_clock"
+    assert not app.trace["calls"]
 
 
 def test_b5c_review_labels_and_preview_expose_selection_attributes(tmp_path):
@@ -1962,6 +2209,7 @@ def test_b5c_review_draft_can_be_approved_after_an_interjected_read(tmp_path):
     hcx = HCX(
         [],
         call("ask_review_agent", request="안 좋은 리뷰에 답글 써줘"),
+        {"role": "assistant", "content": "리뷰 조회 결과"},
         call("get_settlement_summary", period="this_week"),
         {"role": "assistant", "content": "정산을 확인했어요."},
         plans=[
@@ -2057,7 +2305,7 @@ def test_b5c_approval_plan_cannot_turn_a_word_fragment_into_consent(tmp_path, te
     hcx = HCX(
         [],
         call("upsert_menu", name="연습 차", price=5000),
-        {"role": "assistant", "content": "미리보기 내용을 확인해 주세요."},
+        call("ask_owner", fields=[]),
         plans=[new("menu"), on("approve", "t1", "menu")],
     )
     app = assistant(tmp_path, hcx)
@@ -2103,7 +2351,12 @@ def test_b5c_review_read_preserves_blocks_and_shown(tmp_path, monkeypatch, owner
         return {"text": "리뷰 한 건을 살펴봤어요.", "blocks": row["text"]}
 
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", show_one)
-    hcx = HCX([], plans=[new("review")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[new("review")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     reply = app.ask(owner_text)
@@ -2141,7 +2394,11 @@ def test_b5c_report_settings_preview_discloses_alert_changes(tmp_path, monkeypat
 
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", disable_alert)
     request = "리뷰 알림 꺼줘"
-    hcx = HCX([], plans=[settings_plan(request, alert="none")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="계획 실행"),
+        plans=[settings_plan(request, alert="none")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     session = app.planner_loop.session()
@@ -2318,7 +2575,7 @@ def test_b5d_other_feature_question_does_not_continue_a_pending_task(tmp_path, w
     read = {"kind": "new", "feature": "smartcall", "goal": "부재중 전화 조회"}
     hcx = HCX(
         [],
-        {"role": "assistant", "content": "쿠폰 이름과 기간을 알려 주세요."},
+        call("ask_owner", fields=[]),
         call("list_call_history", missed_only=True),
         {"role": "assistant", "content": "전화 기록을 조회했어요."},
         plans=[
@@ -2405,7 +2662,7 @@ def test_b5d_empty_history_and_cancelled_values_cannot_claim_a_save(tmp_path):
     assert app.store.read() == before and len(hcx.requests) == 1
 
 
-def test_b5d_completed_records_reach_execution_and_legacy_answer_context(tmp_path):
+def test_completed_records_reach_loop_execution_and_answer_context(tmp_path):
     hcx = HCX(
         [],
         call("upsert_menu", name="아메리카노", price=4800),
@@ -2416,10 +2673,10 @@ def test_b5d_completed_records_reach_execution_and_legacy_answer_context(tmp_pat
     app.ask("아메리카노 4800원으로 바꿔 주세요")
     app.ask("네")
     app.ask("블린 가격 9300원으로 바꿔 주세요")
-    system = hcx.requests[-1][0][0]["content"]
+    system = hcx.requests[-1][0][1]["content"]
     assert "최근 완료된 일" in system and "아메리카노" in system and "4800" in system
     assert "closed_at" in system
-    loop_messages = app.planner_loop.messages()
+    loop_messages = hcx.requests[-1][0]
     assert "최근 완료된 일" in loop_messages[1]["content"]
 
 
@@ -2461,6 +2718,8 @@ def test_b5d_review_read_rejects_an_internal_draft_tool(tmp_path, monkeypatch):
     monkeypatch.setattr("agenthan.agent.review_delegate.ask_review_agent", wrong_tool)
     hcx = HCX(
         [],
+        call("ask_review_agent", request="계획 실행"),
+        {"role": "assistant", "content": "조회 문장"},
         plans=[
             {
                 "scope": "store",
@@ -2598,7 +2857,12 @@ def test_b5d_review_text_and_original_survive_all_five_read_steps(tmp_path, monk
 
 
 def test_b5d_review_read_cannot_discard_a_held_draft(tmp_path, monkeypatch):
-    hcx = HCX([], plans=[new("review", ref="r02"), new("review")])
+    hcx = HCX(
+        [],
+        call("ask_review_agent", request="리뷰 조회"),
+        {"role": "assistant", "content": "조회 문장"},
+        plans=[new("review", ref="r02"), new("review")],
+    )
     app = assistant(tmp_path, hcx)
     app._review_factory = FakeBackend().review_session
     app.ask("부정적인 리뷰에 답글을 작성해 주세요")
@@ -2629,6 +2893,7 @@ def test_b5d_review_settings_ledger_revision_keeps_its_plan_action(tmp_path, kin
     ][0]["owner_values"]
     hcx = HCX(
         [],
+        call("ask_review_agent", request="계획 실행"),
         plans=[
             settings_plan(first, enabled=True, frequency="weekly", weekday="mon", time="09:00"),
             revision,
@@ -2653,7 +2918,7 @@ def test_b5d_revised_review_batch_card_matches_the_latest_versions(tmp_path):
         [],
         call("upsert_menu", name="블린", price=9500),
         call("ask_review_agent", request="안 좋은 리뷰에 답글 써줘"),
-        {"role": "assistant", "content": "확인했어요."},
+        call("ask_review_agent", request="계획의 답글 수정"),
         plans=[
             {
                 "scope": "store",
@@ -2737,7 +3002,9 @@ def test_b5f_split_read_then_draft_is_one_draft_and_consent_saves_it(tmp_path, a
     hcx = HCX(
         [],
         LIST_CALL,
-        *repeat(phrased(), 6),
+        phrased(),
+        call("ask_review_agent", request="계획의 답글 초안 작성"),
+        phrased(),
         plans=[
             LIST_PLAN,
             review_plan(
@@ -2782,7 +3049,9 @@ def test_b5f_revision_of_a_pending_draft_rewrites_the_same_review(
     hcx = HCX(
         [],
         LIST_CALL,
-        *repeat(phrased(), 6),
+        phrased(),
+        call("ask_review_agent", request="계획의 답글 초안 작성"),
+        phrased(),
         plans=[
             LIST_PLAN,
             review_plan(review_step("안 좋은 리뷰에 답글 작성하기", "draft"), scope="advice"),
@@ -2827,7 +3096,9 @@ def test_b5f_advice_scoped_single_draft_is_executed_not_advised(tmp_path, ask, a
     hcx = HCX(
         [],
         LIST_CALL,
-        *repeat(phrased(), 6),
+        phrased(),
+        call("ask_review_agent", request="계획의 답글 초안 작성"),
+        phrased(),
         plans=[
             LIST_PLAN,
             review_plan(review_step("낮은 별점의 리뷰에 답글 작성하기", "draft"), scope="advice"),
@@ -2841,7 +3112,7 @@ def test_b5f_advice_scoped_single_draft_is_executed_not_advised(tmp_path, ask, a
     assert "통계 신호" not in draft and "필요한 값이나 대상" not in draft
     assert "답글을 달 리뷰: 별점 4" in draft
     # 조건 선택은 ref 없이 계획 goal 그대로 리뷰 에이전트(감정 판단)에 맡긴다(B5e).
-    assert app.trace["via"] == "planner_single"
+    assert app.trace["via"] == "planner" and app.trace["legacy_model_calls"] == 0
     assert app.trace["calls"][0]["arguments"]["request"] == "낮은 별점의 리뷰에 답글 작성하기"
     assert "ref" not in app.trace["planner"]["steps"][0]
     task = app.ledger.active()

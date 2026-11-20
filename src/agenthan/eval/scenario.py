@@ -51,7 +51,7 @@ from agenthan.eval.metrics import _percentile, score_plan, summarize_s2
 from agenthan.eval.replay import EMBED_MODEL, Live, Replay, canonical
 from agenthan.eval.run import BASELINES, REPLAY_PATH, ROOT, _git, display_path, sha256
 from agenthan.tools.dummy_store import DummyStore
-from agenthan.tools.feature_tools import TOOL_FEATURES
+from agenthan.tools.feature_tools import STORE_READ_TOOLS, TOOL_FEATURES
 
 SCENARIOS = ROOT / "tests/data/eval/s1.jsonl"  # S1 regression baseline (docs/eval-baseline.md)
 S2_SCENARIOS = ROOT / "tests/data/eval/s2.jsonl"  # S2 planner target (ADR-0006)
@@ -408,7 +408,7 @@ def normalize_trace(trace: dict | None, review_waiting: bool = False) -> dict | 
                     "feature": (
                         "review"
                         if call["name"] == "ask_review_agent"
-                        else TOOL_FEATURES.get(call["name"])
+                        else TOOL_FEATURES.get(call["name"], STORE_READ_TOOLS.get(call["name"]))
                     ),
                     "action": (
                         action
@@ -439,7 +439,14 @@ def normalize_trace(trace: dict | None, review_waiting: bool = False) -> dict | 
         out["planner"] = trace["planner"]
     if "loop_budget" in trace:
         out["loop_budget"] = copy.deepcopy(trace["loop_budget"])
-    for key in ("loop_errors", "legacy_error", "scope_check", "ledger_steps", "legacy_model_calls"):
+    for key in (
+        "loop_errors",
+        "legacy_error",
+        "scope_check",
+        "ledger_steps",
+        "legacy_model_calls",
+        "fallback",
+    ):
         if key in trace:
             out[key] = copy.deepcopy(trace[key])
     return out

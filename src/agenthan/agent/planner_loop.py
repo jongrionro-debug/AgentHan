@@ -25,6 +25,7 @@ from agenthan.agent.place_matcher import get_feature
 from agenthan.agent.review.clova import ClovaError
 from agenthan.core import llm
 from agenthan.tools.feature_tools import (
+    STORE_READ_TOOLS,
     TOOL_FEATURES,
     TOOLS,
     execute_feature_tool,
@@ -285,6 +286,7 @@ class PlannerLoop:
         # 단계 실패의 1회 재시도 기록: {(단계 identity, 종류)}. 턴마다 비운다.
         self.retried: set[tuple] = set()
         self.plan_retried = False
+        self.turn_text = ""
 
     def button(self, action_id, values, label):
         """계획 묶음 승인·재개 버튼도 모델 없이 코드 경로로 실행한다."""
@@ -455,6 +457,7 @@ class PlannerLoop:
         self.proposals = []
         self.retried = set()
         self.plan_retried = False
+        self.turn_text = state["text"].strip()
         self.a._ref_lookup = None
         self.a.trace = new_trace(None, "planner")
         task = self.a.ledger.active()
@@ -581,6 +584,7 @@ class PlannerLoop:
             "filtered_steps",
             "scope_check",
             "loop_errors",
+            "fallback",
         ):
             if key in trace:
                 self.a.trace[key] = trace[key]
@@ -715,6 +719,7 @@ class PlannerLoop:
                     self.question = "현재 미리보기를 확인하고 다시 승인해 주세요."
                     return {"next": "respond"}
                 # 안전망: 계획 실패·거부·스키마 밖이면 기존 기능 선택·처리로 답한다.
+                self.a.trace["fallback"] = True
                 self.legacy_route = self.route(state["text"])
                 return {"next": "legacy"}
             self.question = (
@@ -776,11 +781,7 @@ class PlannerLoop:
         # 조언 응답(신호·플레이북)은 조회만 하는 계획에만 붙인다. 리뷰 초안·설정은 실행이다.
         self.batch.advice_only = (
             result.scope == "advice"
-            and all(
-                (s.feature == "review" and s.review_action == "read")
-                or (s.feature in TOOLS and not needs_approval(TOOLS[s.feature].name))
-                for s in steps
-            )
+            and all(self.is_read(s) for s in steps)
             and any(s.feature in {"statistics", "review"} for s in steps)
         )
         completed = {s.identity for s in self.batch.completed_steps}
@@ -821,9 +822,7 @@ class PlannerLoop:
             entry = self.shown_entry(step.ref)
             if entry is not None:
                 self.a._ref_lookup = self.ref_lookup(step.feature, entry)
-            # 한 단계 새 요청은 그 기능의 기존 실행기(respond)로 처리한다.
-            self.legacy_route = Route(step.feature, "planner_single")
-            return {"next": "legacy"}
+            # 한 단계도 같은 실행 루프를 쓰며 ref의 lookup 출처를 유지한다.
         self.a.trace["feature"] = steps[0].feature if steps else None
         if result.clarify:
             self.question = self.ask_text([])
@@ -835,8 +834,10 @@ class PlannerLoop:
 
     @staticmethod
     def is_read(step):
-        return (step.feature == "review" and step.review_action == "read") or (
-            step.feature in TOOLS and not needs_approval(TOOLS[step.feature].name)
+        return (
+            step.operation == "read"
+            or (step.feature == "review" and step.review_action == "read")
+            or (step.feature in TOOLS and not needs_approval(TOOLS[step.feature].name))
         )
 
     def dependency_steps(self, result):
@@ -861,6 +862,7 @@ class PlannerLoop:
                         f"{step.goal}에 필요한 대상·값을 조회",
                         review_action="read" if feature == "review" else None,
                         target_metric=step.target_metric if feature == "review" else None,
+                        operation="read",
                     )
                     if not self.is_read(source):
                         return False
@@ -1019,9 +1021,7 @@ class PlannerLoop:
         """추가 근거 조회는 조언에만 허용한다. 기능 단어로 사장님 말을 재분류하지 않는다."""
         steps = []
         for step in result.steps:
-            read = (step.feature == "review" and step.review_action == "read") or (
-                step.feature in TOOLS and not needs_approval(TOOLS[step.feature].name)
-            )
+            read = self.is_read(step)
             if step.basis == "supporting" and (result.scope != "advice" or not read):
                 self.a.trace.setdefault("filtered_steps", []).append(step.as_trace())
             else:
@@ -1165,6 +1165,21 @@ class PlannerLoop:
         if task.kind == "review" and task.preview and task.preview.get("button_review"):
             self.begin_loop(text)
             return self.revise_review(task, step, text)
+        if task.kind == "tool":
+            if task.preview and step.kind == "revise":
+                self.a.ledger.drop_preview(task)
+            if self.batch.text != text.strip():
+                self.batch.text += FOLLOW_UP + text.strip()
+            self.batch.remaining = [
+                step,
+                *(s for s in self.batch.remaining if s.feature != task.feature),
+            ]
+            self.batch.steps = list(self.batch.remaining)
+            self.budget.plan_steps(len(self.batch.remaining))
+            self.begin_loop(text)
+            self.a._turn_task = task.id
+            self.note_said(task, text.strip())
+            return {"next": "act"}
         self.legacy_route = Route(task.feature, "planner_" + step.kind, act=act)
         return {"next": "legacy"}
 
@@ -1349,7 +1364,7 @@ class PlannerLoop:
         for call, result in zip(trace.get("calls", []), trace.get("results", []), strict=False):
             if not isinstance(result, dict) or not result.get("ok"):
                 continue
-            feature = TOOL_FEATURES.get(call.get("name"))
+            feature = TOOL_FEATURES.get(call.get("name"), STORE_READ_TOOLS.get(call.get("name")))
             if feature is None or result.get("action") == "pending_approval":
                 continue
             records = result.get("records")
@@ -1476,19 +1491,46 @@ class PlannerLoop:
     def exposed(self):
         from agenthan.agent.owner_assistant import RECORD_TARGETS, target_schema
 
-        features = list(dict.fromkeys(s.feature for s in self.batch.remaining))[:8]
-        current = self.batch.remaining[0].feature if self.batch.remaining else None
-        targets = self.step_targets() if current in RECORD_TARGETS else None
-        return [
-            REVIEW if f == "review" else target_schema(f, targets if f == current else None)
-            for f in features
-            if f == "review" or f in TOOLS
-        ] + [ASK_OWNER]
+        current = self.batch.remaining[0]
+        tools = []
+        steps = [current] if self.is_read(current) else self.batch.remaining
+        for step in steps:
+            feature = step.feature
+            if self.is_read(step) and f"read_{feature}" in STORE_READ_TOOLS:
+                tool = schema(
+                    f"read_{feature}",
+                    f"{get_feature(feature)['name_ko']}의 현재 가게 자료 조회. 변경·승인 없음.",
+                    {},
+                    [],
+                )
+            elif feature == "review":
+                tool = REVIEW
+            else:
+                targets = (
+                    self.step_targets(step)
+                    if step == current and feature in RECORD_TARGETS
+                    else None
+                )
+                tool = target_schema(feature, targets)
+            if tool not in tools:
+                tools.append(tool)
+            if len(tools) == 8:
+                break
+        return [*tools, ASK_OWNER]
+
+    @staticmethod
+    def note_said(task, text):
+        if not task.said or task.said[-1] != text:
+            task.said.append(text)
 
     def step_said(self, step=None):
         """이 단계 몫의 사장님 말(다른 단계의 말은 뺀다)."""
         step = step or self.batch.remaining[0]
         return step_portion(self.batch.text, step, self.batch.steps or [step])
+
+    def owner_said(self):
+        step = self.batch.remaining[0]
+        return self.turn_text if step.task_id else self.batch.text
 
     def step_targets(self, step=None):
         """현재 단계의 대상 후보. 모델 호출 전 노출·실행·값 출처 게이트가 같은 집합을 쓴다.
@@ -1500,7 +1542,16 @@ class PlannerLoop:
         if step.feature not in RECORD_TARGETS:
             return None
         task = self.a.ledger.find_open(step.feature)
-        said = "\n".join(filter(None, [step.goal, self.step_said(step)]))
+        said = "\n".join(
+            filter(
+                None,
+                [
+                    step.goal,
+                    *(task.said if task and step.task_id and not self.is_read(step) else []),
+                    self.step_said(step),
+                ],
+            )
+        )
         return self.a._record_targets(step.feature, task, said=said)
 
     def messages(self):
@@ -1513,6 +1564,15 @@ class PlannerLoop:
         values = store_slice(step.feature, self.a.store.read())
         targets = self.step_targets(step)
         candidates = ("\n" + targets_line(targets)) if targets is not None else ""
+        memory = ""
+        if task is not None and not self.is_read(step):
+            memory = (
+                "이 작업에서 사장님이 한 말: "
+                + json.dumps(task.said, ensure_ascii=False)
+                + "\n이미 확인된 값: "
+                + json.dumps({k: s.value for k, s in task.slots.items()}, ensure_ascii=False)
+                + "\n"
+            )
         return [
             {"role": "system", "content": SYSTEM},
             {
@@ -1521,7 +1581,8 @@ class PlannerLoop:
                     planner.today_context(self.a.today) + "\n"
                     f"사장님 말: {self.batch.text}\n범위: {self.batch.scope}\n"
                     f"현재 단계: {step.feature} / {step.goal}\n열린 작업: {context}\n"
-                    f"가게 자료: {json.dumps(values, ensure_ascii=False)}{candidates}\n"
+                    + memory
+                    + f"가게 자료: {json.dumps(values, ensure_ascii=False)}{candidates}\n"
                     + self.completed_context()
                     + "\n"
                     "관찰:\n" + "\n".join(self.step_observations(step))
@@ -1583,6 +1644,10 @@ class PlannerLoop:
         return True
 
     def skip(self):
+        step = self.batch.remaining[0]
+        task = self.a.ledger.find_open(step.feature, "tool")
+        if task is not None and task.preview is None:
+            self.question = self.ask_text([])
         step = self.batch.remaining.pop(0)
         self.failed.append(step)
         self.batch.observations.append(f"{step.feature}: 처리하지 못함")
@@ -1594,15 +1659,32 @@ class PlannerLoop:
 
         allowed = {
             p[3]
-            for step in self.batch.remaining
+            for step in self.batch.remaining[:1]
             if step.feature in TOOLS
             for p in tool_params(step.feature)
         }
         if any(
-            s.feature == "review" and s.review_action == "settings" for s in self.batch.remaining
+            s.feature == "review" and s.review_action == "settings"
+            for s in self.batch.remaining[:1]
         ):
             allowed.update(p[3] for p in self.settings_params())
         names = [f for f in fields if f in allowed]
+        if not names and self.batch.remaining:
+            step = self.batch.remaining[0]
+            if step.feature in TOOLS and not (
+                self.is_read(step) and f"read_{step.feature}" in STORE_READ_TOOLS
+            ):
+                task = (
+                    self.a.ledger.find_open(step.feature, "tool")
+                    if not self.is_read(step)
+                    else None
+                )
+                required = {p.id for p in TOOLS[step.feature].params if p.required}
+                names = [
+                    label
+                    for name, _, _, label in tool_params(step.feature)
+                    if name in required and (task is None or name not in task.slots)
+                ]
         if not names and self.last_action.get("kind") == "ask":
             names = list(fields)  # 기존 단일 기능 실행기의 질문도 상태에서 재사용한다.
         if names:
@@ -1685,13 +1767,22 @@ class PlannerLoop:
                 self.question = self.ask_text(fields if isinstance(fields, list) else [])
                 if self.batch.remaining:
                     feature = self.batch.remaining[0].feature
-                    if feature in TOOLS:
+                    if feature in TOOLS and not self.is_read(self.batch.remaining[0]):
                         task = self.a._task_for(feature, "tool")
-                        task.said.append(self.batch.text)
+                        self.note_said(task, self.owner_said())
                         self.batches[task.id] = self.batch
                 break
-            feature = "review" if name == "ask_review_agent" else TOOL_FEATURES.get(name)
-            if not self.batch.remaining or feature != self.batch.remaining[0].feature:
+            feature = (
+                "review"
+                if name == "ask_review_agent"
+                else STORE_READ_TOOLS.get(name, TOOL_FEATURES.get(name))
+            )
+            allowed = {self.exposed()[0]["function"]["name"]} if self.batch.remaining else set()
+            if (
+                name not in allowed
+                or not self.batch.remaining
+                or feature != self.batch.remaining[0].feature
+            ):
                 self.batch.observations.append("도구가 현재 계획 단계와 다름: 실행하지 않음")
                 if self.budget.replan():
                     return {"next": "plan"}
@@ -1738,6 +1829,8 @@ class PlannerLoop:
         return {"next": "observe"}
 
     def execute(self, feature, name, args):
+        if name in STORE_READ_TOOLS:
+            return self.read_store(feature)
         if feature == "statistics":
             facts = report_facts(
                 load_report(), period="day" if "오늘" in self.batch.text else "week"
@@ -1784,6 +1877,7 @@ class PlannerLoop:
         from agenthan.agent.owner_assistant import ADD_HINT, EDIT_HINT
 
         task = self.a._task_for(feature, "tool")
+        self.note_said(task, self.owner_said())
         dependent = next(
             (s for s in self.batch.remaining if s.feature == feature and s.needs), None
         )
@@ -1809,11 +1903,11 @@ class PlannerLoop:
             if not ADD_HINT.search(self.batch.text) and EDIT_HINT.search(self.batch.text):
                 self.a.ledger.drop_preview(task)
             self.detach(task)
-        if not task.said or task.said[-1] != self.batch.text:
-            task.said.append(self.batch.text)
         self.batches[task.id] = self.batch
-        self.a._adding = task.id in self.batch.tasks or bool(ADD_HINT.search(self.batch.text))
         step = self.batch.remaining[0]
+        self.a._adding = (step.kind == "new" and task.id in self.batch.tasks) or bool(
+            ADD_HINT.search(self.turn_text)
+        )
         self.a._targets = (
             self.step_targets(step)
             if step.feature == feature
@@ -1825,6 +1919,53 @@ class PlannerLoop:
         if result.get("action") == "pending_approval":
             self.register(task)
         return result
+
+    def read_store(self, feature):
+        """기능 범위의 실제 자료만 읽는다. 작업 생성·재개·값 변경은 하지 않는다."""
+        from agenthan.agent.owner_assistant import store_slice, tool_params
+
+        data = store_slice(feature, self.a.store.read())
+        targets = self.step_targets()
+        records = (
+            targets["views"] if targets is not None else data.get("menus", data.get("coupons"))
+        )
+        labels = {
+            "id": "번호",
+            "name": "이름",
+            "price": "가격 (원)",
+            "status": "상태",
+            "items": "주문 항목",
+            "date": "날짜",
+            "time": "시각",
+            "people": "인원",
+            "message": "문의",
+            "shop": "가게",
+            "menus": "메뉴",
+            "coupons": "쿠폰",
+            "hours": "영업시간",
+            "phone": "전화번호",
+            "address": "주소",
+            "introduction": "소개",
+            "keywords": "대표키워드",
+            "category": "업종",
+            **{k: label for k, _, _, label in tool_params(feature)},
+        }
+
+        def render(value):
+            if isinstance(value, dict):
+                return ", ".join(f"{labels.get(k, k)}: {render(v)}" for k, v in value.items())
+            if isinstance(value, list):
+                return " / ".join(render(v) for v in value) or "없음"
+            return "없음" if value is None else str(value)
+
+        return {
+            "ok": True,
+            "action": "read",
+            **({"records": records} if records is not None else {"record": data}),
+            "text": get_feature(feature)["name_ko"]
+            + " 조회\n"
+            + render(records if records is not None else data),
+        }
 
     def menu_mentions(self):
         """리뷰 원문에서 실제 메뉴·별칭의 등장 횟수를 센다. 표본 수에 따른 중단은 없다."""
@@ -2012,11 +2153,7 @@ class PlannerLoop:
             return {"next": "respond"}
         # 미리보기 뒤의 조회는 저장 결과를 읽을 수 있게 승인 다음 턴으로 미룬다.
         step = self.batch.remaining[0]
-        if (
-            self.batch.tasks
-            and step.feature in TOOLS
-            and not needs_approval(TOOLS[step.feature].name)
-        ):
+        if self.batch.tasks and self.is_read(step):
             return {"next": "respond"}
         return {"next": "act"}
 
@@ -2687,6 +2824,7 @@ class PlannerLoop:
         self.a.trace["loop_budget"] = self.budget.trace()
         self.a.trace["budget_exhausted"] = self.budget.reason is not None
         self.a.trace["next_actions"] = copy.deepcopy(self.a.next_actions)
+        self.a.trace["legacy_model_calls"] = self.legacy_models
         return {"answer": self.a._end_turn("\n".join(lines) or self.ask_text([]))}
 
     @staticmethod

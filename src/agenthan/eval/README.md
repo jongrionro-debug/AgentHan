@@ -182,8 +182,10 @@ uv run --frozen --offline python -m agenthan.eval.seed_replay          # 합성 
 
 쓰기 도구는 앱에서 저장소 사본에 미리 실행하고 사장님이 `네`라고 답해야 실제로 저장된다.
 조회 전용은 `list_call_history`, `get_naverpay_signup_guide`, `get_settlement_summary`,
-`check_pos_compatibility`, `get_statistics`, `search_help_articles`다
-(`tools/feature_tools.READ_ONLY_TOOLS`). 알 수 없는 호출은 쓰기로 취급한다.
+`check_pos_compatibility`, `diagnose_search_visibility`, `get_statistics`, `search_help_articles`다
+(`tools/feature_tools.READ_ONLY_TOOLS`). planner의 쓰기 기능 조회 도구 `read_<feature>`도
+`STORE_READ_TOOLS`에 등록된 것만 조회로 취급하고 trace의 원래 기능으로 매핑한다.
+알 수 없는 호출은 쓰기로 취급한다. 계획 실패 뒤 legacy 안전망은 `fallback: true`로 구분한다.
 
 보조 지표는 지연 p50/p95(route는 분기, flow는 턴 단위. 재생 지연은 모델 지연이 아님),
 flow 턴당 총 토큰, API 오류, kind·lang·기대값별 정확도, 기대→실제 혼동 상위 10쌍이다.

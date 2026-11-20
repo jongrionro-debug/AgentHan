@@ -744,11 +744,17 @@ READ_ONLY_TOOLS = frozenset(
         "search_help_articles",
     }
 )
+# PlannerLoop가 store_slice·대상 후보로 실행하는 조회 도구. 기존 17개 도구 목록은 유지한다.
+STORE_READ_TOOLS = {
+    f"read_{feature}": feature
+    for feature, tool in TOOLS.items()
+    if tool.name not in READ_ONLY_TOOLS
+}
 
 
 def needs_approval(tool: str | None) -> bool:
     """Unknown tools are conservatively treated as writes; no call needs no approval."""
-    return tool is not None and tool not in READ_ONLY_TOOLS
+    return tool is not None and tool not in READ_ONLY_TOOLS and tool not in STORE_READ_TOOLS
 
 
 def feature_tool_schema(feature_id: str) -> dict:
