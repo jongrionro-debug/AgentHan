@@ -1,5 +1,9 @@
 # 리뷰 도구 통합 안내 (`integrate/review-tools`)
 
+> **2026-11-08 기록이다. 지금과 다른 점:** `review_reply`·`ai_review`는 기능 `review` 하나로 합쳤다(3f71771).
+> `owner_tools.py`는 없어지고 도구는 `tools/feature_tools.py` 한 곳에 있다(58949d2, `docs/tools.md`).
+> 담당 구분 없이 함께 작업하며 작업 브랜치는 upstream `feat/s1-baseline`이다. 평가는 `docs/eval-baseline.md`를 따른다.
+
 근형님께. 종현 작성, 2026-11-08.
 
 ## 1. 한 줄 요약
@@ -17,7 +21,7 @@
  → OwnerAssistant (기능 매칭)                         ← 종현
      ├ menu                     → upsert_menu
      ├ review_reply, ai_review  → review_delegate.handle(utterance, session)
-     │                              → review_tools.agent.run_turn + ReviewToolbox  ← 근형님 코드
+     │                              → agenthan.agent.review.agent.run_turn + ReviewToolbox  ← 근형님 코드
      └ 그 밖의 15개 기능          → 이름·설명 안내 (도구는 정의만, 아직 미연결)
 ```
 
@@ -99,7 +103,7 @@ uv run --env-file .env pytest -q -m network   # 실제 CLOVA 호출
 
 ## 7. 확인 부탁드릴 결정
 
-1. **C-1 지원 언어**: 지금은 발화 문자로 ko/en/ru/vi/zh를 판별해 `owner_lang`으로 넘깁니다(`review_tools.agent.LANG_NAMES`와 같은 범위). 줄이거나 늘릴지.
+1. **C-1 지원 언어**: 지금은 발화 문자로 ko/en/ru/vi/zh를 판별해 `owner_lang`으로 넘깁니다(`agenthan.agent.review.agent.LANG_NAMES`와 같은 범위). 줄이거나 늘릴지.
 2. **C-2 메뉴 원어명 입력 주체**: 메뉴에 `aliases` 필드는 생겼지만 입력 경로는 아직 없습니다(새 메뉴는 `aliases: []`, 정식명으로만 매칭). 사장님이 직접 넣을지, 번역으로 채울지.
 3. **C-3 답글 약속 허용 범위**: `OWNER_PROMISES_ALLOWED = True`(사장님이 지시한 약속만 ⚠ 표시 후 허용) 그대로 두었습니다.
 4. **`upstream/feature/assistant-core`**(032517f, `assistant.py` 804줄): 이번 통합에는 넣지 않았습니다. 쓸지, 정리할지.
@@ -111,4 +115,4 @@ uv run --env-file .env pytest -q -m network   # 실제 CLOVA 호출
 
 - 실제 HCX 호출은 이번 통합 뒤에 돌려 보지 않았습니다(오프라인 테스트만). 특히 v3 → OpenAI 호환 전환 후 메뉴 도구 호출과 위임 흐름 E2E.
 - 통합 기준은 로컬에 있던 `upstream/feature/9-review-tools` 0fb5f03입니다. 그 뒤 커밋이 있으면 다시 합쳐야 합니다.
-- `models/baseline.joblib`(14MB)이 저장소에 함께 들어옵니다.
+- `models/baseline.joblib`은 실제 리뷰로 학습해 저장소에 올리지 않습니다(gitignore). 카톡으로 받아 `models/`에 두거나 `scripts/train_baseline.py`로 학습합니다.

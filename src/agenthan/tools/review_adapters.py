@@ -1,22 +1,25 @@
-"""DummyStore → review_tools adapters: one shop data source for both sides.
+"""DummyStore → agenthan.agent.review adapters: one shop data source for both sides.
 
-- DummyStoreReviewRepo: review_tools.ReviewRepo over the store's reviews
-- DummyStoreMenuCatalog: review_tools.MenuCatalog over the store's menus (read live, so a
+- DummyStoreReviewRepo: agenthan.agent.review.ReviewRepo over the store's reviews
+- DummyStoreMenuCatalog: agenthan.agent.review.MenuCatalog over the store's menus (read live, so a
   menu registered with upsert_menu is matched in review questions right away)
-- DummyStoreReplyStore: review_tools MockReplyStore whose post() saves into the store
+- DummyStoreReplyStore: agenthan.agent.review MockReplyStore whose post() saves into the store
   (status saved_not_sent; nothing is sent to Naver)
 
-Store review row (same as review_tools snapshots, also the target schema for crawled data):
+Store review row (same as agenthan.agent.review snapshots, also the target schema for crawled data):
     {review_id, visit_date, rating, text, features, has_owner_reply[, owner_reply]}
 The adapter adds "store" (shop name) and "category" (shop category).
 """
 
 from datetime import date, datetime
 
+from agenthan.agent.review.replies import MockReplyStore
+from agenthan.agent.review.repo import ReviewRepo
+from agenthan.agent.review.topic import MenuCatalog
+from agenthan.tools import menu_index
 from agenthan.tools.dummy_store import DummyStore
-from review_tools.replies import MockReplyStore
-from review_tools.repo import ReviewRepo
-from review_tools.topic import MenuCatalog
+
+FACTS_LIMIT = 3  # menus per review given to the reply writer
 
 
 class DummyStoreReviewRepo(ReviewRepo):
@@ -53,6 +56,13 @@ class DummyStoreMenuCatalog(MenuCatalog):
             {"name": m["name"], "aliases": list(m.get("aliases", []))}
             for m in self.store.read()["menus"]
         ]
+
+    def facts_for(self, store: str, text: str) -> list[dict]:
+        """Menus the text mentions, by the store knowledge RAG over this shop (ADR-0008)."""
+        index = menu_index.index_for(self.store.read())
+        if index is None:
+            return []
+        return [index.facts(menu_id) for menu_id in index.mentions(text)[:FACTS_LIMIT]]
 
 
 class DummyStoreReplyStore(MockReplyStore):

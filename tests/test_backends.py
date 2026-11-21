@@ -2,11 +2,12 @@
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
-from naver_review_clf import FEATURES, get_backend
-from naver_review_clf.backends.hcx import HCXBackend
-from naver_review_clf.segment import split_clauses
+import pytest
+
+from agenthan.tools.review_clf import FEATURES, get_backend
+from agenthan.tools.review_clf.backends.hcx import HCXBackend
+from agenthan.tools.review_clf.segment import split_clauses
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,6 +19,10 @@ def test_segment_offsets():
         assert TEXT[c.start : c.end] == c.text
 
 
+@pytest.mark.skipif(
+    not (ROOT / "models" / "baseline.joblib").exists(),
+    reason="baseline 모델은 레포에 없다 (실제 리뷰로 학습). 팀에서 받아 models/에 둔다",
+)
 def test_baseline():
     r = get_backend("baseline").classify(TEXT)
     assert set(r.labels) <= set(FEATURES)
@@ -33,12 +38,10 @@ class FakeClient:
     def __init__(self, replies):
         self.replies = list(replies)
         self.calls = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def _create(self, **kw):
-        self.calls.append(kw)
-        msg = SimpleNamespace(content=self.replies.pop(0))
-        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+    def chat(self, model, messages, **kw):  # ClovaClient.chat과 같은 모양
+        self.calls.append({"model": model, "messages": messages, **kw})
+        return {"role": "assistant", "content": self.replies.pop(0)}
 
 
 def test_hcx_parsing_and_retry():
@@ -57,8 +60,8 @@ def test_hcx_parsing_and_retry():
     client = FakeClient(["이건 JSON이 아닙니다", "```json\n" + good + "\n```"])
     r = HCXBackend(client=client, model="HCX-005").classify(TEXT)
     assert len(client.calls) == 2  # 재시도 1회
-    assert "response_format" not in client.calls[0]  # HCX-005는 response_format을 거절함
-    assert client.calls[0]["max_tokens"] == 1024
+    assert "responseFormat" not in client.calls[0]  # HCX-005는 responseFormat을 거절함(400)
+    assert client.calls[0]["maxTokens"] == 1024
     d = {f.feature: [h.text for h in f.highlights] for f in r.features}
     assert d["대기시간"] == ["음식도 빨리 나와서 좋았어요"]  # 이웃 절 병합
     assert d["맛"] == ["밥과 된장국도 맛있고"]
@@ -66,11 +69,11 @@ def test_hcx_parsing_and_retry():
 
 
 def test_hcx007_options():
-    from naver_review_clf.backends.hcx import request_options
+    from agenthan.tools.review_clf.backends.hcx import request_options
 
     o = request_options("HCX-007")
-    assert o["response_format"]["type"] == "json_schema" and "max_tokens" not in o
-    assert o["extra_body"] == {"reasoning_effort": "none"}
+    assert o["responseFormat"]["type"] == "json" and "maxTokens" not in o
+    assert o["maxCompletionTokens"] == 1024 and o["thinking"] == {"effort": "none"}
 
 
 if __name__ == "__main__":

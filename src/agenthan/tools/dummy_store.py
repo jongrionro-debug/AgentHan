@@ -1,7 +1,10 @@
-"""Local-only shop data. No publishing or network operations."""
+"""Local shop data in a JSON file. With AGENTHAN_DB_URL set, every write is also copied to the
+assistant_store_docs table (agenthan.db), and a missing file is read back from that copy.
+No publishing operations."""
 
 import json
 import os
+import re
 import tempfile
 import unicodedata
 import uuid
@@ -65,6 +68,28 @@ def _migrate_review(record: dict) -> dict:
     return record
 
 
+def _db_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def _db_copy(path: Path) -> dict | None:
+    """AGENTHAN_DB_URL이 있으면 assistant_store_docs의 사본. 없거나 DB가 꺼져 있으면 None."""
+    if not os.environ.get("AGENTHAN_DB_URL"):
+        return None
+    from agenthan.db.stores import load_assistant_doc
+
+    return load_assistant_doc(_db_key(path))
+
+
+def _db_save(path: Path, data: dict) -> None:
+    """파일을 쓴 뒤 DB에도 한 벌(실패해도 파일은 이미 저장됨)."""
+    if not os.environ.get("AGENTHAN_DB_URL"):
+        return
+    from agenthan.db.stores import save_assistant_doc
+
+    save_assistant_doc(_db_key(path), data)
+
+
 class DummyStore:
     def __init__(self, path: str | Path = DEFAULT_STORE):
         self.path = Path(path).expanduser()
@@ -74,8 +99,10 @@ class DummyStore:
     def read(self) -> dict:
         """Before the first valid write, read the seed without creating a file."""
         try:
-            source = self.path if self.path.exists() else SEED_PATH
-            data = json.loads(source.read_text(encoding="utf-8"))
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            else:  # 파일이 없으면 DB 사본(재배포로 파일이 사라진 경우) → 없으면 시드
+                data = _db_copy(self.path) or json.loads(SEED_PATH.read_text(encoding="utf-8"))
             if (
                 not isinstance(data, dict)
                 or not isinstance(data.get("shop"), dict)
@@ -94,7 +121,7 @@ class DummyStore:
                     or any(not isinstance(a, str) for a in record["aliases"])
                 ):
                     raise ValueError
-            # Reviews use the review_tools row schema:
+            # Reviews use the agenthan.agent.review row schema:
             # {review_id, visit_date, rating, text, features, has_owner_reply[, owner_reply]}
             for record in data["reviews"]:
                 _migrate_review(record)
@@ -132,6 +159,7 @@ class DummyStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(self.path)
+            _db_save(self.path, data)
             return
         except OSError:
             pass
@@ -140,11 +168,45 @@ class DummyStore:
                 temporary.unlink()
         raise DummyStoreError("더미 저장소에 저장할 수 없습니다.")
 
-    def upsert_menu(self, name: str, price: int) -> dict:
+    def set_shop_info(self, name: str, category: str) -> dict:
+        """처음 쓰는 사장님 온보딩(#94): 가게 이름·업종만 바꾸고 나머지 가게 정보는 둔다."""
+        values = {"name": name, "category": category}
+        if any(not isinstance(v, str) or not normalize(v) for v in values.values()):
+            raise DummyStoreError("가게 이름과 업종이 필요합니다.")
+        data = self.read()
+        data["shop"].update({k: " ".join(v.split()) for k, v in values.items()})
+        self._write(data)
+        return data["shop"]
+
+    def upsert_menu(
+        self,
+        name: str,
+        price: int,
+        *,
+        description: str | None = None,
+        name_native: str | None = None,
+        photo: bytes | None = None,
+        photo_mime: str | None = None,
+        menu_id: str | None = None,
+        create_only: bool = False,
+    ) -> dict:
+        """같은 이름이면 가격을 고치고, 없으면 등록한다. description·name_native는 줄 때만 저장
+        (메뉴 사진 등록 A-1)."""
         if not isinstance(name, str) or not normalize(name) or not valid_price(price):
             raise DummyStoreError("메뉴 이름과 양의 정수 가격(원)이 필요합니다.")
+        extra = {
+            k: " ".join(v.split())
+            for k, v in (("description", description), ("name_native", name_native))
+            if isinstance(v, str) and v.strip()
+        }
         data = self.read()
         record = next((m for m in data["menus"] if normalize(m["name"]) == normalize(name)), None)
+        if menu_id is not None:
+            record = next((m for m in data["menus"] if m["id"] == menu_id), None)
+            if record is None:
+                raise DummyStoreError("기존 메뉴를 저장소에서 찾을 수 없습니다.")
+        elif create_only and record is not None:
+            raise DummyStoreError("같은 이름의 메뉴가 이미 있습니다. 사진 변경을 확인해 주세요.")
         previous_price = None
         action = "created"
         if record is None:
@@ -159,6 +221,33 @@ class DummyStore:
             action = "updated"
             previous_price = record["price"]
             record["price"] = price
+        record.update(extra)
+        if photo is not None:
+            if photo_mime not in ("image/jpeg", "image/png") or not isinstance(photo, bytes):
+                raise DummyStoreError("사진 형식이 올바르지 않습니다.")
+            if self.path.parent.resolve() == SEED_PATH.parent.resolve():
+                raise DummyStoreError("시드 파일 옆에는 사진을 저장할 수 없습니다.")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", record["id"]):
+                raise DummyStoreError("메뉴 ID가 올바르지 않습니다.")
+            photo_dir = self.path.parent / "photos"
+            filename = record["id"] + (".png" if photo_mime == "image/png" else ".jpg")
+            temporary = None
+            try:
+                photo_dir.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    dir=photo_dir, suffix=".tmp", delete=False
+                ) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(photo)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(photo_dir / filename)
+            except OSError:
+                raise DummyStoreError("사진을 저장할 수 없습니다.") from None
+            finally:
+                if temporary is not None and temporary.exists():
+                    temporary.unlink()
+            record["photo"] = f"photos/{filename}"
         self._write(data)
         saved = next(m for m in self.read()["menus"] if m["id"] == record["id"])
         result = {"ok": True, "action": action, "record": saved}
